@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 
 from whisperme.config import Config
@@ -8,6 +9,8 @@ from whisperme.overlay import Overlay
 from whisperme.paster import paste
 from whisperme.postprocess import cleanup
 from whisperme.recorder import Recorder
+
+logger = logging.getLogger(__name__)
 
 
 class App:
@@ -64,6 +67,7 @@ class App:
                 self._start_recording()
 
     def _start_recording(self) -> None:
+        logger.info("Recording start requested")
         self._recording = True
         self._llm_last_input = ""
         self._overlay.show()
@@ -72,6 +76,7 @@ class App:
     def _stop_recording(self) -> None:
         self._recording = False
         text = self._recorder.stop()
+        logger.info("Recording stopped: final_text_len=%d", len(text))
         self._overlay.hide()
 
         if text.strip():
@@ -79,12 +84,16 @@ class App:
                 threading.Thread(target=paste, args=(text,), daemon=True).start()
             else:
                 def _cleanup_and_paste():
-                    cleaned = cleanup(text)
-                    paste(cleaned)
+                    try:
+                        cleaned = cleanup(text)
+                        paste(cleaned)
+                    except Exception:
+                        logger.exception("cleanup-and-paste failed")
                 threading.Thread(target=_cleanup_and_paste, daemon=True).start()
 
     def _reset_recording(self) -> None:
         """Reset: stop current recording, clear text, start fresh — overlay stays open."""
+        logger.info("Reset requested")
         with self._lock:
             self._recording = False
             self._llm_pending = None
@@ -95,6 +104,7 @@ class App:
 
     def _close_without_paste(self) -> None:
         """Close: stop recording, hide overlay, discard text."""
+        logger.info("Close without paste requested")
         with self._lock:
             self._recording = False
             self._llm_pending = None
@@ -122,6 +132,7 @@ class App:
             try:
                 cleaned = cleanup(text)
             except Exception as e:
+                logger.exception("Realtime LLM cleanup crashed")
                 print(f"[app] LLM realtime cleanup failed: {e}", flush=True)
                 with self._lock:
                     self._llm_running = False

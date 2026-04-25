@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 from collections.abc import Callable
@@ -7,6 +8,8 @@ from collections.abc import Callable
 from RealtimeSTT import AudioToTextRecorder
 
 from whisperme.config import Config
+
+logger = logging.getLogger(__name__)
 
 
 class Recorder:
@@ -39,6 +42,12 @@ class Recorder:
         """Create the STT engine once, then process start/stop/shutdown commands."""
         try:
             print("[recorder] Initializing RealtimeSTT...", flush=True)
+            logger.info(
+                "Initializing RealtimeSTT: model=%s realtime_model=%s language=%s",
+                self._config.model,
+                self._config.realtime_model,
+                self._config.language,
+            )
             self._recorder = AudioToTextRecorder(
                 model=self._config.model,
                 language=self._config.language,
@@ -54,32 +63,39 @@ class Recorder:
                 silero_sensitivity=0.3,
             )
         except Exception as e:
+            logger.exception("ERROR initializing recorder")
             print(f"[recorder] ERROR initializing recorder: {e}", flush=True)
             self._ready.set()
             return
 
         self._ready.set()
         print("[recorder] RealtimeSTT ready", flush=True)
+        logger.info("RealtimeSTT ready")
 
         while True:
             command = self._commands.get()
 
-            if command == "start":
-                self._start_session()
-                continue
+            try:
+                if command == "start":
+                    self._start_session()
+                    continue
 
-            if command == "stop":
-                self._stop_session()
-                continue
+                if command == "stop":
+                    self._stop_session()
+                    continue
 
-            if command == "shutdown":
-                self._stop_session()
-                try:
-                    if self._recorder is not None:
-                        self._recorder.shutdown()
-                except Exception as e:
-                    print(f"[recorder] ERROR during shutdown: {e}", flush=True)
-                return
+                if command == "shutdown":
+                    self._stop_session()
+                    try:
+                        if self._recorder is not None:
+                            self._recorder.shutdown()
+                    except Exception as e:
+                        logger.exception("ERROR during shutdown")
+                        print(f"[recorder] ERROR during shutdown: {e}", flush=True)
+                    return
+            except Exception:
+                # Never let an unexpected error kill the worker thread.
+                logger.exception("Recorder worker caught unexpected error on command=%s", command)
 
     def start(self) -> None:
         self._ready.wait()
@@ -111,8 +127,10 @@ class Recorder:
             self._start_microphone_feeder()
             self._session_active = True
             print("[recorder] Recording active", flush=True)
+            logger.info("Session started: sample_rate=%d", self._mic_sample_rate)
         except Exception as e:
             self._close_microphone()
+            logger.exception("ERROR starting session")
             print(f"[recorder] ERROR starting session: {e}", flush=True)
 
     def _stop_session(self) -> None:
@@ -128,7 +146,9 @@ class Recorder:
         try:
             recorder.stop()
             recorder.clear_audio_queue()
+            logger.info("Session stopped")
         except Exception as e:
+            logger.exception("ERROR stopping session")
             print(f"[recorder] ERROR stopping session: {e}", flush=True)
         finally:
             self._session_active = False
@@ -216,6 +236,7 @@ class Recorder:
                 chunk = stream.read(self._mic_chunk_size, exception_on_overflow=False)
             except Exception as e:
                 if not self._mic_stop.is_set():
+                    logger.exception("ERROR reading microphone")
                     print(f"[recorder] ERROR reading microphone: {e}", flush=True)
                 break
 
@@ -223,6 +244,7 @@ class Recorder:
                 recorder.feed_audio(chunk, original_sample_rate=self._mic_sample_rate)
             except Exception as e:
                 if not self._mic_stop.is_set():
+                    logger.exception("ERROR feeding audio")
                     print(f"[recorder] ERROR feeding audio: {e}", flush=True)
                 break
 
