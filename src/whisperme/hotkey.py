@@ -11,6 +11,11 @@ logger = logging.getLogger(__name__)
 # Key code for "/" on US keyboard
 _SLASH_KEYCODE = 44
 
+# The OS delivers these event types when it disables a tap. They are sent
+# regardless of the event mask, so the callback must handle them explicitly.
+_TAP_DISABLED_TIMEOUT = getattr(Quartz, "kCGEventTapDisabledByTimeout", 0xFFFFFFFE)
+_TAP_DISABLED_USER_INPUT = getattr(Quartz, "kCGEventTapDisabledByUserInput", 0xFFFFFFFF)
+
 
 class HotkeyListener:
     """Detects Option+/ toggle using Quartz CGEventTap (suppresses the keystroke)."""
@@ -24,6 +29,17 @@ class HotkeyListener:
         mask = (1 << Quartz.kCGEventKeyDown)
 
         def callback(proxy, event_type, event, refcon):
+            # macOS disables the tap if a callback runs too long (timeout) or on
+            # certain user input. If we don't re-enable it, the hotkey silently
+            # stops working until the app is restarted — a common "it just froze"
+            # symptom. Re-enable and carry on.
+            if event_type in (_TAP_DISABLED_TIMEOUT, _TAP_DISABLED_USER_INPUT):
+                logger.warning("Event tap disabled by system (type=%s); re-enabling", event_type)
+                print("[hotkey] Event tap disabled by system; re-enabling", flush=True)
+                if self._tap is not None:
+                    Quartz.CGEventTapEnable(self._tap, True)
+                return event
+
             try:
                 keycode = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
                 flags = Quartz.CGEventGetFlags(event)

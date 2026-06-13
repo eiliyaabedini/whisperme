@@ -25,16 +25,22 @@ def paste(text: str) -> None:
     # Small delay to ensure clipboard is ready
     time.sleep(0.05)
 
-    # Simulate Cmd+V
-    _kb.press(Key.cmd)
-    _kb.press("v")
-    _kb.release("v")
-    _kb.release(Key.cmd)
+    # Simulate Cmd+V. Release inside finally so a mid-combo error can never
+    # leave Cmd "stuck down", which would otherwise hijack every subsequent
+    # keystroke and look like a system-wide freeze.
+    try:
+        _kb.press(Key.cmd)
+        _kb.press("v")
+        _kb.release("v")
+    finally:
+        _kb.release(Key.cmd)
 
-    # Restore old clipboard after a short delay
+    # Restore old clipboard after a delay long enough for the target app to have
+    # consumed the paste. Restoring too early races the async paste and can paste
+    # the OLD clipboard contents instead of the dictated text.
     if old is not None:
         def _restore():
-            time.sleep(0.5)
+            time.sleep(1.2)
             try:
                 subprocess.run(["pbcopy"], input=old, timeout=2)
             except Exception:
