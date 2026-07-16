@@ -10,13 +10,41 @@ Local push-to-talk voice dictation for macOS. Press Option+/ to record, release 
 - `src/whisperme/hotkey.py` — Quartz CGEventTap for global Option+/ hotkey
 - `src/whisperme/paster.py` — pbcopy + simulated Cmd+V via pynput
 - `src/whisperme/postprocess.py` — Optional Apple Foundation Model cleanup
-- `src/whisperme/config.py` — CLI args (--model, --realtime-model, --language, --no-llm)
+- `src/whisperme/statusbar.py` — NSStatusItem menu bar icon (idle/recording/processing states, quit, start-at-login)
+- `src/whisperme/permissions.py` — Interactive Microphone + Accessibility setup wizard (NSAlert flow)
+- `src/whisperme/autofix.py` — "Auto-Fix Recent Issues" menu action: runs `claude -p` headlessly (scoped --allowedTools) to diagnose recent crashes from logs/, fix src/, commit + push; report saved to logs/autofix/
+- `src/whisperme/autostart.py` — Start-at-login LaunchAgent (~/Library/LaunchAgents/com.eiliya.whisperme.plist)
+- `src/whisperme/paths.py` — Shared REPO_DIR/LOG_DIR + app bundle discovery
+- `src/whisperme/config.py` — CLI args (--model, --realtime-model, --language, --no-llm, --no-setup)
 
 ## Running
 
 ```
-uv run whisperme
+uv run whisperme            # from a terminal (permissions attach to the terminal app)
 ```
+
+## Installing as a macOS app
+
+```
+scripts/install.sh [--open]
+```
+
+Builds `dist/WhisperMe.app` and installs it to /Applications. The bundle's main
+executable is a small compiled stub (`scripts/launcher.c`, paths baked in at build
+time) that spawns `uv run whisperme` as a child and stays resident. It MUST stay
+resident: macOS attributes TCC permissions (Microphone/Accessibility) to the
+bundle's responsible process, and children inherit it. An earlier version exec'd
+into uv, which made TCC register/check the "uv" binary instead of WhisperMe —
+grants to WhisperMe.app never matched and permission prompts looped forever.
+The bundle has its own identifier (`com.eiliya.whisperme`) and `LSUIElement=true`
+(menu bar only, no Dock icon). First launch runs the interactive permission
+wizard; it can be re-run from the menu bar icon → Permission Setup. Rebuilding
+changes the ad-hoc code signature; if permissions act stale after a reinstall,
+clear them with `tccutil reset Accessibility com.eiliya.whisperme` (and
+`Microphone`) so the wizard re-registers cleanly.
+
+Only one instance runs at a time (flock on `logs/whisperme.lock`); a second
+launch shows an "already running" alert and exits.
 
 ## Logs
 

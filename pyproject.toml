@@ -8,6 +8,7 @@ dependencies = [
     "pyobjc-framework-Cocoa",
     "pynput",
     "apple-fm-sdk",
+    "pyobjc-framework-avfoundation>=12.2.1",
 ]
 
 [project.scripts]

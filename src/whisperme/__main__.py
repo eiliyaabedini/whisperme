@@ -1,4 +1,5 @@
 import faulthandler
+import fcntl
 import logging
 import os
 import shutil
@@ -8,8 +9,7 @@ from pathlib import Path
 
 from whisperme.config import Config
 from whisperme.app import App
-
-LOG_DIR = Path(__file__).resolve().parent.parent.parent / "logs"
+from whisperme.paths import LOG_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +17,9 @@ logger = logging.getLogger(__name__)
 # on a fatal signal, so its file descriptor must never be closed or GC'd.
 _crash_log_fp = None
 _stdout_log_fp = None
+
+# Held (flocked) for the whole process lifetime; the OS releases it on exit.
+_instance_lock_fp = None
 
 
 def _roll_if_large(path: Path, max_bytes: int = 5 * 1024 * 1024) -> None:
@@ -155,14 +158,54 @@ def _scan_previous_crashes() -> None:
         )
 
 
+def _acquire_single_instance_lock() -> bool:
+    """Prevent two instances (e.g. login item + terminal run) fighting over the
+    hotkey and double-pasting. The flock is released automatically on exit."""
+    global _instance_lock_fp
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _instance_lock_fp = open(LOG_DIR / "whisperme.lock", "w")
+    try:
+        fcntl.flock(_instance_lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    _instance_lock_fp.write(str(os.getpid()))
+    _instance_lock_fp.flush()
+    return True
+
+
+def _show_already_running_alert() -> None:
+    try:
+        import AppKit
+
+        app = AppKit.NSApplication.sharedApplication()
+        app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
+        app.activateIgnoringOtherApps_(True)
+        alert = AppKit.NSAlert.alloc().init()
+        alert.setMessageText_("WhisperMe is already running")
+        alert.setInformativeText_(
+            "Look for the microphone icon in the menu bar at the top of the "
+            "screen. Press Option+/ in any app to dictate."
+        )
+        alert.addButtonWithTitle_("OK")
+        alert.runModal()
+    except Exception:
+        logger.exception("Could not show already-running alert")
+
+
 def main() -> None:
     _setup_logging()
     _install_excepthooks()
+    config = Config.from_args()
+    if not _acquire_single_instance_lock():
+        logger.warning("Another WhisperMe instance is already running; exiting")
+        print("[whisperme] Already running — look for the mic icon in the menu bar.", flush=True)
+        if not config.no_setup:
+            _show_already_running_alert()
+        return
     print(f"[whisperme] Logs are saved to {LOG_DIR}", flush=True)
     logger.info("=== SESSION START (pid=%d) argv=%s ===", os.getpid(), sys.argv[1:])
     _scan_previous_crashes()
     try:
-        config = Config.from_args()
         app = App(config)
         try:
             app.run()

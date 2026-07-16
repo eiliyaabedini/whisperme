@@ -10,6 +10,7 @@ class Config:
     realtime_model: str = "base.en"
     language: str = "en"
     no_llm: bool = False
+    no_setup: bool = False
 
     @classmethod
     def from_args(cls) -> Config:
@@ -37,10 +38,16 @@ class Config:
             action="store_true",
             help="Disable LLM post-processing",
         )
+        parser.add_argument(
+            "--no-setup",
+            action="store_true",
+            help="Skip the interactive permission setup dialogs",
+        )
         args = parser.parse_args()
         return cls(
             model=args.model,
             realtime_model=args.realtime_model,
             language=args.language,
             no_llm=args.no_llm,
+            no_setup=args.no_setup,
         )
