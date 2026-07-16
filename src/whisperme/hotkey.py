@@ -25,7 +25,11 @@ class HotkeyListener:
         self._tap = None
         self._loop_source = None
 
-    def start(self) -> None:
+    def start(self) -> bool:
+        """Register the global event tap. Returns True if the hotkey is active."""
+        if self._tap is not None:
+            return True
+
         mask = (1 << Quartz.kCGEventKeyDown)
 
         def callback(proxy, event_type, event, refcon):
@@ -70,7 +74,7 @@ class HotkeyListener:
         if self._tap is None:
             logger.error("Could not create event tap — Accessibility permissions likely missing")
             print("[hotkey] ERROR: Could not create event tap. Check Accessibility permissions.", flush=True)
-            return
+            return False
 
         self._loop_source = Quartz.CFMachPortCreateRunLoopSource(None, self._tap, 0)
         loop = Quartz.CFRunLoopGetMain()
@@ -78,6 +82,7 @@ class HotkeyListener:
         Quartz.CGEventTapEnable(self._tap, True)
         print("[hotkey] Global event tap registered", flush=True)
         logger.info("Global event tap registered")
+        return True
 
     def stop(self) -> None:
         if self._tap:

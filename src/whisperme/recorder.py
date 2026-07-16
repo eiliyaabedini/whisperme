@@ -200,6 +200,27 @@ class Recorder:
     def _close_microphone(self) -> None:
         self._mic_stop.set()
 
+        # The feeder thread must be fully out of stream.read() BEFORE the
+        # stream is closed: pyaudio's read() runs in C with the GIL released,
+        # and Pa_CloseStream frees the ring buffer it reads from. Closing
+        # while a read is in flight is a use-after-free that kills the whole
+        # process with SIGBUS/SIGSEGV in PaUtil_ReadRingBuffer (the "app just
+        # vanished after I stopped dictating" crash). read() returns every
+        # ~64 ms, so the join is quick.
+        mic_thread = self._mic_thread
+        if mic_thread is not None and mic_thread.is_alive():
+            mic_thread.join(timeout=2)
+            if mic_thread.is_alive():
+                # Feeder is wedged inside PortAudio. Abandon the stream —
+                # leaking it once is recoverable, freeing it under a live
+                # read crashes the app.
+                logger.error("Mic feeder thread did not exit; abandoning stream instead of freeing it")
+                self._mic_thread = None
+                self._audio_stream = None
+                self._audio_interface = None
+                return
+        self._mic_thread = None
+
         stream = self._audio_stream
         self._audio_stream = None
         if stream is not None:
@@ -211,11 +232,6 @@ class Recorder:
                 stream.close()
             except Exception:
                 pass
-
-        mic_thread = self._mic_thread
-        if mic_thread is not None and mic_thread.is_alive():
-            mic_thread.join(timeout=1)
-        self._mic_thread = None
 
         audio = self._audio_interface
         self._audio_interface = None
