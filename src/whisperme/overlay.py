@@ -1,29 +1,32 @@
 from __future__ import annotations
 
+import logging
 import signal
+import threading
+from collections import deque
 from collections.abc import Callable
 
 import AppKit
 import objc
 from Foundation import NSObject, NSRange
 from PyObjCTools import AppHelper
+from Quartz import CABasicAnimation
 
+logger = logging.getLogger(__name__)
 
-_WIDTH = 480
-_HEADER_HEIGHT = 70  # status + target + buttons
-_MIN_HEIGHT = 130
-_MAX_HEIGHT = 400
-_PADDING = 20
+_WIDTH = 440
+_PAD = 16
+_MIN_HEIGHT = 122
+_MAX_HEIGHT = 420
+_CORNER_RADIUS = 18
+# Vertical space used by everything except the text area (header + waveform)
+_CHROME_ABOVE_TEXT = 98
+_BOTTOM_PAD = 14
+_CURSOR_GAP = 14  # distance between the cursor and the panel edge
 
 
 class _ButtonTarget(NSObject):
     """ObjC target for button actions."""
-
-    def initWithCallbacks_close_(self, reset_cb, close_cb):
-        self = objc.super(_ButtonTarget, self).init()
-        self._reset_cb = reset_cb
-        self._close_cb = close_cb
-        return self
 
     @objc.python_method
     def set_callbacks(self, reset_cb: Callable, close_cb: Callable) -> None:
@@ -41,8 +44,59 @@ class _ButtonTarget(NSObject):
             self._close_cb()
 
 
+class _WaveformView(AppKit.NSView):
+    """Rounded voice-level bars that fill left-to-right as speech accumulates,
+    then scroll once the strip is full."""
+
+    _BAR_WIDTH = 3.0
+    _BAR_GAP = 2.0
+    _MIN_BAR = 3.0
+
+    def initWithFrame_(self, frame):
+        self = objc.super(_WaveformView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._levels: list[float] = []
+        return self
+
+    @objc.python_method
+    def capacity(self) -> int:
+        step = self._BAR_WIDTH + self._BAR_GAP
+        return max(1, int(self.bounds().size.width // step))
+
+    @objc.python_method
+    def add_level(self, level: float) -> None:
+        self._levels.append(max(0.0, min(1.0, level)))
+        overflow = len(self._levels) - self.capacity()
+        if overflow > 0:
+            del self._levels[:overflow]
+        self.setNeedsDisplay_(True)
+
+    @objc.python_method
+    def clear(self) -> None:
+        self._levels = []
+        self.setNeedsDisplay_(True)
+
+    def drawRect_(self, rect) -> None:
+        try:
+            bounds = self.bounds()
+            height = bounds.size.height
+            AppKit.NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.85).setFill()
+            step = self._BAR_WIDTH + self._BAR_GAP
+            for i, level in enumerate(self._levels):
+                bar_h = self._MIN_BAR + level * (height - self._MIN_BAR)
+                bar = AppKit.NSMakeRect(
+                    i * step, (height - bar_h) / 2.0, self._BAR_WIDTH, bar_h
+                )
+                AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                    bar, self._BAR_WIDTH / 2.0, self._BAR_WIDTH / 2.0
+                ).fill()
+        except Exception:  # never let drawing take the app down
+            logger.exception("waveform drawRect failed")
+
+
 class Overlay:
-    """Floating NSPanel overlay showing recording status and live transcription."""
+    """Cursor-anchored frosted panel with live waveform and cleaned transcription."""
 
     def __init__(
         self,
@@ -50,36 +104,41 @@ class Overlay:
         on_close: Callable[[], None] | None = None,
         show_llm: bool = False,
     ) -> None:
+        self._app: AppKit.NSApplication | None = None
         self._panel: AppKit.NSPanel | None = None
         self._status_field: AppKit.NSTextField | None = None
         self._target_field: AppKit.NSTextField | None = None
+        self._dot_field: AppKit.NSTextField | None = None
+        self._wave_view: _WaveformView | None = None
         self._scroll_view: AppKit.NSScrollView | None = None
         self._text_view: AppKit.NSTextView | None = None
-        self._llm_label: AppKit.NSTextField | None = None
-        self._llm_scroll_view: AppKit.NSScrollView | None = None
-        self._llm_text_view: AppKit.NSTextView | None = None
-        self._app: AppKit.NSApplication | None = None
-        self._target_timer: AppKit.NSTimer | None = None
-        self._screen_y: float = 0
+
         self._show_llm = show_llm
+        self._has_cleaned = False
+        self._levels: deque[float] = deque()  # fed from the mic thread
+        self._wave_timer: AppKit.NSTimer | None = None
+        self._target_timer: AppKit.NSTimer | None = None
+
+        # Placement anchor: ("below", top_y) keeps the top edge pinned under the
+        # cursor; ("above", bottom_y) keeps the bottom edge pinned over it.
+        self._anchor_mode = "below"
+        self._anchor_y = 0.0
+        self._visible_frame = AppKit.NSMakeRect(0, 0, 0, 0)
+
         self._button_target = _ButtonTarget.alloc().init()
         self._button_target.set_callbacks(on_reset or (lambda: None), on_close or (lambda: None))
         self._setup()
+
+    # -- construction --------------------------------------------------------
 
     def _setup(self) -> None:
         self._app = AppKit.NSApplication.sharedApplication()
         self._app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
 
-        screen = AppKit.NSScreen.mainScreen().frame()
-        x = (screen.size.width - _WIDTH) / 2
-        self._screen_y = screen.size.height * 0.75
-
-        rect = AppKit.NSMakeRect(x, self._screen_y, _WIDTH, _MIN_HEIGHT)
-        style = AppKit.NSWindowStyleMaskBorderless
-
+        rect = AppKit.NSMakeRect(0, 0, _WIDTH, _MIN_HEIGHT)
         self._panel = AppKit.NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
             rect,
-            style | AppKit.NSWindowStyleMaskNonactivatingPanel,
+            AppKit.NSWindowStyleMaskBorderless | AppKit.NSWindowStyleMaskNonactivatingPanel,
             AppKit.NSBackingStoreBuffered,
             False,
         )
@@ -90,93 +149,77 @@ class Overlay:
             | AppKit.NSWindowCollectionBehaviorIgnoresCycle
         )
         self._panel.setOpaque_(False)
-        self._panel.setBackgroundColor_(
-            AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(0.1, 0.1, 0.1, 0.92)
-        )
+        self._panel.setBackgroundColor_(AppKit.NSColor.clearColor())
         self._panel.setHasShadow_(True)
         self._panel.setMovableByWindowBackground_(True)
         self._panel.setFloatingPanel_(True)
         self._panel.setHidesOnDeactivate_(False)
-
-        content = self._panel.contentView()
-        content.setWantsLayer_(True)
-        content.layer().setCornerRadius_(16.0)
-        content.layer().setMasksToBounds_(True)
-
-        # Status label — top left
-        self._status_field = AppKit.NSTextField.alloc().initWithFrame_(
-            AppKit.NSMakeRect(_PADDING, _MIN_HEIGHT - 40, _WIDTH - 160, 30)
+        self._panel.setAppearance_(
+            AppKit.NSAppearance.appearanceNamed_(AppKit.NSAppearanceNameDarkAqua)
         )
-        self._status_field.setStringValue_("Listening...")
-        self._status_field.setFont_(AppKit.NSFont.boldSystemFontOfSize_(16))
-        self._status_field.setTextColor_(AppKit.NSColor.systemRedColor())
-        self._status_field.setBezeled_(False)
-        self._status_field.setDrawsBackground_(False)
-        self._status_field.setEditable_(False)
-        self._status_field.setSelectable_(False)
-        self._status_field.setAutoresizingMask_(AppKit.NSViewMinYMargin)
+
+        # Frosted-glass background with rounded corners
+        effect = AppKit.NSVisualEffectView.alloc().initWithFrame_(rect)
+        effect.setMaterial_(AppKit.NSVisualEffectMaterialHUDWindow)
+        effect.setBlendingMode_(AppKit.NSVisualEffectBlendingModeBehindWindow)
+        effect.setState_(AppKit.NSVisualEffectStateActive)
+        effect.setWantsLayer_(True)
+        effect.layer().setCornerRadius_(_CORNER_RADIUS)
+        effect.layer().setMasksToBounds_(True)
+        self._panel.setContentView_(effect)
+        content = effect
+
+        # Pulsing recording dot
+        self._dot_field = self._make_label("●", 13, AppKit.NSColor.systemRedColor())
+        self._dot_field.setWantsLayer_(True)
+        content.addSubview_(self._dot_field)
+
+        self._status_field = self._make_label(
+            "Listening…", 14, AppKit.NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.95)
+        )
+        self._status_field.setFont_(AppKit.NSFont.boldSystemFontOfSize_(14))
         content.addSubview_(self._status_field)
 
-        # Close button (X) — top right
-        close_btn = AppKit.NSButton.alloc().initWithFrame_(
-            AppKit.NSMakeRect(_WIDTH - 45, _MIN_HEIGHT - 40, 30, 30)
+        self._target_field = self._make_label(
+            "", 11, AppKit.NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.45)
         )
-        close_btn.setBezelStyle_(AppKit.NSBezelStyleCircular)
-        close_btn.setTitle_("X")
-        close_btn.setFont_(AppKit.NSFont.boldSystemFontOfSize_(12))
-        close_btn.setTarget_(self._button_target)
-        close_btn.setAction_(objc.selector(self._button_target.onClose_, signature=b"v@:@"))
-        close_btn.setToolTip_("Close without pasting")
-        close_btn.setAutoresizingMask_(AppKit.NSViewMinYMargin)
-        content.addSubview_(close_btn)
-
-        # Reset button — next to close
-        reset_btn = AppKit.NSButton.alloc().initWithFrame_(
-            AppKit.NSMakeRect(_WIDTH - 90, _MIN_HEIGHT - 40, 40, 30)
-        )
-        reset_btn.setBezelStyle_(AppKit.NSBezelStyleCircular)
-        reset_btn.setTitle_("R")
-        reset_btn.setFont_(AppKit.NSFont.boldSystemFontOfSize_(12))
-        reset_btn.setTarget_(self._button_target)
-        reset_btn.setAction_(objc.selector(self._button_target.onReset_, signature=b"v@:@"))
-        reset_btn.setToolTip_("Reset and keep listening")
-        reset_btn.setAutoresizingMask_(AppKit.NSViewMinYMargin)
-        content.addSubview_(reset_btn)
-
-        # Target app label — below status
-        self._target_field = AppKit.NSTextField.alloc().initWithFrame_(
-            AppKit.NSMakeRect(_PADDING, _MIN_HEIGHT - 57, _WIDTH - 160, 18)
-        )
-        self._target_field.setStringValue_("")
-        self._target_field.setFont_(AppKit.NSFont.systemFontOfSize_(11))
-        self._target_field.setTextColor_(
-            AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(0.6, 0.6, 0.6, 1.0)
-        )
-        self._target_field.setBezeled_(False)
-        self._target_field.setDrawsBackground_(False)
-        self._target_field.setEditable_(False)
-        self._target_field.setSelectable_(False)
-        self._target_field.setAutoresizingMask_(AppKit.NSViewMinYMargin)
         content.addSubview_(self._target_field)
 
-        # Scrollable text view for live transcription
-        text_area_height = _MIN_HEIGHT - _HEADER_HEIGHT - _PADDING
-        scroll_rect = AppKit.NSMakeRect(_PADDING, _PADDING, _WIDTH - 2 * _PADDING, text_area_height)
+        self._reset_btn = self._make_icon_button(
+            "arrow.counterclockwise.circle.fill",
+            "R",
+            "Reset and keep listening (⌥R)",
+            objc.selector(self._button_target.onReset_, signature=b"v@:@"),
+        )
+        content.addSubview_(self._reset_btn)
 
-        self._scroll_view = AppKit.NSScrollView.alloc().initWithFrame_(scroll_rect)
+        self._close_btn = self._make_icon_button(
+            "xmark.circle.fill",
+            "X",
+            "Close without pasting (⌥. or ⌥X)",
+            objc.selector(self._button_target.onClose_, signature=b"v@:@"),
+        )
+        content.addSubview_(self._close_btn)
+
+        self._wave_view = _WaveformView.alloc().initWithFrame_(
+            AppKit.NSMakeRect(_PAD, 0, _WIDTH - 2 * _PAD, 30)
+        )
+        content.addSubview_(self._wave_view)
+
+        self._scroll_view = AppKit.NSScrollView.alloc().initWithFrame_(
+            AppKit.NSMakeRect(_PAD, _BOTTOM_PAD, _WIDTH - 2 * _PAD, 10)
+        )
         self._scroll_view.setHasVerticalScroller_(True)
         self._scroll_view.setHasHorizontalScroller_(False)
         self._scroll_view.setAutohidesScrollers_(True)
         self._scroll_view.setDrawsBackground_(False)
         self._scroll_view.setBorderType_(AppKit.NSNoBorder)
-        self._scroll_view.setAutoresizingMask_(
-            AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable
-        )
 
-        text_view_rect = AppKit.NSMakeRect(0, 0, _WIDTH - 2 * _PADDING, text_area_height)
-        self._text_view = AppKit.NSTextView.alloc().initWithFrame_(text_view_rect)
+        self._text_view = AppKit.NSTextView.alloc().initWithFrame_(
+            AppKit.NSMakeRect(0, 0, _WIDTH - 2 * _PAD, 10)
+        )
         self._text_view.setFont_(AppKit.NSFont.systemFontOfSize_(14))
-        self._text_view.setTextColor_(AppKit.NSColor.whiteColor())
+        self._text_view.setTextColor_(self._preview_color())
         self._text_view.setBackgroundColor_(AppKit.NSColor.clearColor())
         self._text_view.setDrawsBackground_(False)
         self._text_view.setEditable_(False)
@@ -186,202 +229,239 @@ class Overlay:
         self._text_view.setHorizontallyResizable_(False)
         self._text_view.setVerticallyResizable_(True)
         self._text_view.setMaxSize_(AppKit.NSMakeSize(_WIDTH, 1e7))
-
         self._scroll_view.setDocumentView_(self._text_view)
         content.addSubview_(self._scroll_view)
 
-        if self._show_llm:
-            # Separator + LLM label
-            sep_y = _PADDING + text_area_height + 2
-            self._llm_label = AppKit.NSTextField.alloc().initWithFrame_(
-                AppKit.NSMakeRect(_PADDING, sep_y, _WIDTH - 2 * _PADDING, 16)
-            )
-            self._llm_label.setStringValue_("── Cleaned ──")
-            self._llm_label.setFont_(AppKit.NSFont.systemFontOfSize_(10))
-            self._llm_label.setTextColor_(
-                AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(0.5, 0.5, 0.5, 1.0)
-            )
-            self._llm_label.setBezeled_(False)
-            self._llm_label.setDrawsBackground_(False)
-            self._llm_label.setEditable_(False)
-            self._llm_label.setSelectable_(False)
-            self._llm_label.setHidden_(True)
-            content.addSubview_(self._llm_label)
+        self._layout(_MIN_HEIGHT)
 
-            # LLM text view
-            llm_rect = AppKit.NSMakeRect(_PADDING, _PADDING, _WIDTH - 2 * _PADDING, text_area_height)
-            self._llm_scroll_view = AppKit.NSScrollView.alloc().initWithFrame_(llm_rect)
-            self._llm_scroll_view.setHasVerticalScroller_(True)
-            self._llm_scroll_view.setHasHorizontalScroller_(False)
-            self._llm_scroll_view.setAutohidesScrollers_(True)
-            self._llm_scroll_view.setDrawsBackground_(False)
-            self._llm_scroll_view.setBorderType_(AppKit.NSNoBorder)
+    @staticmethod
+    def _make_label(text: str, size: float, color) -> AppKit.NSTextField:
+        label = AppKit.NSTextField.alloc().initWithFrame_(AppKit.NSMakeRect(0, 0, 10, 10))
+        label.setStringValue_(text)
+        label.setFont_(AppKit.NSFont.systemFontOfSize_(size))
+        label.setTextColor_(color)
+        label.setBezeled_(False)
+        label.setDrawsBackground_(False)
+        label.setEditable_(False)
+        label.setSelectable_(False)
+        return label
 
-            llm_tv_rect = AppKit.NSMakeRect(0, 0, _WIDTH - 2 * _PADDING, text_area_height)
-            self._llm_text_view = AppKit.NSTextView.alloc().initWithFrame_(llm_tv_rect)
-            self._llm_text_view.setFont_(AppKit.NSFont.systemFontOfSize_(14))
-            self._llm_text_view.setTextColor_(
-                AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(0.6, 1.0, 0.6, 1.0)
+    def _make_icon_button(self, symbol: str, fallback: str, tooltip: str, action) -> AppKit.NSButton:
+        btn = AppKit.NSButton.alloc().initWithFrame_(AppKit.NSMakeRect(0, 0, 26, 26))
+        image = AppKit.NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+            symbol, tooltip
+        )
+        if image is not None:
+            config = AppKit.NSImageSymbolConfiguration.configurationWithPointSize_weight_(
+                17, AppKit.NSFontWeightRegular
             )
-            self._llm_text_view.setBackgroundColor_(AppKit.NSColor.clearColor())
-            self._llm_text_view.setDrawsBackground_(False)
-            self._llm_text_view.setEditable_(False)
-            self._llm_text_view.setSelectable_(False)
-            self._llm_text_view.setRichText_(False)
-            self._llm_text_view.textContainer().setWidthTracksTextView_(True)
-            self._llm_text_view.setHorizontallyResizable_(False)
-            self._llm_text_view.setVerticallyResizable_(True)
-            self._llm_text_view.setMaxSize_(AppKit.NSMakeSize(_WIDTH, 1e7))
+            sized = image.imageWithSymbolConfiguration_(config)
+            btn.setImage_(sized if sized is not None else image)
+            btn.setImagePosition_(AppKit.NSImageOnly)
+            btn.setContentTintColor_(
+                AppKit.NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.55)
+            )
+        else:
+            btn.setTitle_(fallback)
+        btn.setBordered_(False)
+        btn.setToolTip_(tooltip)
+        btn.setTarget_(self._button_target)
+        btn.setAction_(action)
+        return btn
 
-            self._llm_scroll_view.setDocumentView_(self._llm_text_view)
-            self._llm_scroll_view.setHidden_(True)
-            content.addSubview_(self._llm_scroll_view)
+    def _preview_color(self):
+        return AppKit.NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.55)
+
+    def _final_color(self):
+        return AppKit.NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.95)
+
+    # -- layout & placement --------------------------------------------------
+
+    def _layout(self, height: float) -> None:
+        """Place subviews for a panel of the given height (AppKit y-up coords)."""
+        w = _WIDTH
+        self._dot_field.setFrame_(AppKit.NSMakeRect(_PAD, height - 34, 16, 18))
+        self._status_field.setFrame_(AppKit.NSMakeRect(_PAD + 17, height - 36, 220, 22))
+        self._close_btn.setFrame_(AppKit.NSMakeRect(w - _PAD - 26, height - 36, 26, 26))
+        self._reset_btn.setFrame_(AppKit.NSMakeRect(w - _PAD - 60, height - 36, 26, 26))
+        self._target_field.setFrame_(AppKit.NSMakeRect(_PAD + 17, height - 54, w - 2 * _PAD - 90, 15))
+        self._wave_view.setFrame_(AppKit.NSMakeRect(_PAD, height - 90, w - 2 * _PAD, 30))
+        text_h = max(4.0, height - _CHROME_ABOVE_TEXT - _BOTTOM_PAD)
+        self._scroll_view.setFrame_(AppKit.NSMakeRect(_PAD, _BOTTOM_PAD, w - 2 * _PAD, text_h))
+
+    def _pick_position(self, height: float) -> None:
+        """Anchor the panel to the current mouse location, flipping above the
+        cursor when there isn't room below, and clamping to the screen."""
+        mouse = AppKit.NSEvent.mouseLocation()
+        screen = None
+        for candidate in AppKit.NSScreen.screens():
+            if AppKit.NSPointInRect(mouse, candidate.frame()):
+                screen = candidate
+                break
+        if screen is None:
+            screen = AppKit.NSScreen.mainScreen()
+        vis = screen.visibleFrame()
+        self._visible_frame = vis
+
+        x = mouse.x - _WIDTH / 2.0
+        x = max(vis.origin.x + 8, min(x, vis.origin.x + vis.size.width - _WIDTH - 8))
+
+        below_origin = mouse.y - _CURSOR_GAP - height
+        if below_origin >= vis.origin.y + 8:
+            self._anchor_mode = "below"
+            self._anchor_y = mouse.y - _CURSOR_GAP  # panel top edge
+            y = below_origin
+        else:
+            self._anchor_mode = "above"
+            self._anchor_y = mouse.y + _CURSOR_GAP  # panel bottom edge
+            y = self._anchor_y
+
+        self._panel.setFrame_display_(AppKit.NSMakeRect(x, y, _WIDTH, height), True)
+        self._layout(height)
+
+    def _frame_for_height(self, height: float) -> AppKit.NSRect:
+        frame = self._panel.frame()
+        vis = self._visible_frame
+        if self._anchor_mode == "below":
+            y = self._anchor_y - height
+            if vis.size.height and y < vis.origin.y + 8:
+                y = vis.origin.y + 8
+        else:
+            y = self._anchor_y
+            if vis.size.height and y + height > vis.origin.y + vis.size.height - 8:
+                y = vis.origin.y + vis.size.height - 8 - height
+        return AppKit.NSMakeRect(frame.origin.x, y, _WIDTH, height)
 
     def _resize_panel(self) -> None:
-        """Grow panel height to fit text content, up to _MAX_HEIGHT."""
         layout_manager = self._text_view.layoutManager()
         text_container = self._text_view.textContainer()
         layout_manager.ensureLayoutForTextContainer_(text_container)
-        text_rect = layout_manager.usedRectForTextContainer_(text_container)
-        raw_height = text_rect.size.height + 10
+        used = layout_manager.usedRectForTextContainer_(text_container)
+        text_h = used.size.height + 8 if self._text_view.string() else 0
+        desired = _CHROME_ABOVE_TEXT + _BOTTOM_PAD + text_h
+        desired = int(min(_MAX_HEIGHT, max(_MIN_HEIGHT, desired)))
 
-        llm_height = 0
-        if self._show_llm and self._llm_text_view and not self._llm_scroll_view.isHidden():
-            lm = self._llm_text_view.layoutManager()
-            tc = self._llm_text_view.textContainer()
-            lm.ensureLayoutForTextContainer_(tc)
-            lr = lm.usedRectForTextContainer_(tc)
-            llm_height = lr.size.height + 10 + 20  # +20 for label + gap
-
-        total = raw_height + llm_height + _HEADER_HEIGHT + _PADDING
-        max_h = _MAX_HEIGHT + (200 if llm_height > 0 else 0)
-        desired = int(min(max_h, max(_MIN_HEIGHT, total)))
-        frame = self._panel.frame()
-
-        if int(frame.size.height) != desired:
-            delta = desired - frame.size.height
-            new_frame = AppKit.NSMakeRect(
-                frame.origin.x,
-                frame.origin.y - delta,
-                frame.size.width,
-                desired,
+        if int(self._panel.frame().size.height) != desired:
+            self._panel.setFrame_display_animate_(
+                self._frame_for_height(desired), True, True
             )
-            self._panel.setFrame_display_animate_(new_frame, True, False)
+            self._layout(desired)
 
-        # Reposition raw text area in upper half, LLM in lower half
-        if self._show_llm and self._llm_text_view and not self._llm_scroll_view.isHidden():
-            content_h = desired - _HEADER_HEIGHT - _PADDING
-            half = content_h // 2
-            # LLM at bottom
-            self._llm_scroll_view.setFrame_(
-                AppKit.NSMakeRect(_PADDING, _PADDING, _WIDTH - 2 * _PADDING, half - 20)
-            )
-            # Label between
-            self._llm_label.setFrame_(
-                AppKit.NSMakeRect(_PADDING, _PADDING + half - 18, _WIDTH - 2 * _PADDING, 16)
-            )
-            # Raw text at top
-            self._scroll_view.setFrame_(
-                AppKit.NSMakeRect(_PADDING, _PADDING + half, _WIDTH - 2 * _PADDING, half)
-            )
+    # -- timers ---------------------------------------------------------------
 
-    def _update_target_app(self) -> None:
-        front_app = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
-        app_name = front_app.localizedName() if front_app else "Unknown"
-        self._target_field.setStringValue_(f"Pasting to: {app_name}")
-
-    def _start_target_timer(self) -> None:
-        self._stop_target_timer()
+    def _start_timers(self) -> None:
+        self._stop_timers()
+        self._wave_timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
+            0.05, True, lambda timer: self._drain_levels()
+        )
         self._target_timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
             0.5, True, lambda timer: self._update_target_app()
         )
 
-    def _stop_target_timer(self) -> None:
-        if self._target_timer:
-            self._target_timer.invalidate()
-            self._target_timer = None
+    def _stop_timers(self) -> None:
+        for timer in (self._wave_timer, self._target_timer):
+            if timer:
+                timer.invalidate()
+        self._wave_timer = None
+        self._target_timer = None
+
+    def _drain_levels(self) -> None:
+        while self._levels:
+            self._wave_view.add_level(self._levels.popleft())
+
+    def _update_target_app(self) -> None:
+        front = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+        name = front.localizedName() if front else "?"
+        self._target_field.setStringValue_(f"→ {name}")
+
+    def _start_dot_pulse(self) -> None:
+        layer = self._dot_field.layer()
+        if layer is None:
+            return
+        pulse = CABasicAnimation.animationWithKeyPath_("opacity")
+        pulse.setFromValue_(1.0)
+        pulse.setToValue_(0.25)
+        pulse.setDuration_(0.8)
+        pulse.setAutoreverses_(True)
+        pulse.setRepeatCount_(1e9)
+        layer.addAnimation_forKey_(pulse, "pulse")
+
+    # -- public API (thread-safe) ---------------------------------------------
+
+    def push_level(self, level: float) -> None:
+        """Feed a mic level sample (0..1) from any thread."""
+        self._levels.append(level)
 
     def show(self) -> None:
         def _show():
-            self._status_field.setStringValue_("Listening...")
-            self._status_field.setTextColor_(AppKit.NSColor.systemRedColor())
+            self._has_cleaned = False
+            self._levels.clear()
+            self._wave_view.clear()
+            self._status_field.setStringValue_("Listening…")
             self._text_view.setString_("")
-            if self._llm_text_view:
-                self._llm_text_view.setString_("")
-            if self._llm_label:
-                self._llm_label.setHidden_(True)
-            if self._llm_scroll_view:
-                self._llm_scroll_view.setHidden_(True)
-            self._update_target_app()
-            self._start_target_timer()
-            # Reset to min size
-            screen = AppKit.NSScreen.mainScreen().frame()
-            x = (screen.size.width - _WIDTH) / 2
-            self._panel.setFrame_display_(
-                AppKit.NSMakeRect(x, self._screen_y, _WIDTH, _MIN_HEIGHT), True
+            self._text_view.setTextColor_(
+                self._preview_color() if self._show_llm else self._final_color()
             )
+            self._update_target_app()
+            self._pick_position(_MIN_HEIGHT)
+            self._start_timers()
+            self._start_dot_pulse()
             self._panel.orderFrontRegardless()
 
         AppHelper.callAfter(_show)
 
     def hide(self) -> None:
         def _hide():
-            self._stop_target_timer()
+            self._stop_timers()
             self._panel.orderOut_(None)
 
         AppHelper.callAfter(_hide)
 
     def reset(self) -> None:
         def _reset():
-            self._status_field.setStringValue_("Listening...")
-            self._status_field.setTextColor_(AppKit.NSColor.systemRedColor())
+            self._has_cleaned = False
+            self._levels.clear()
+            self._wave_view.clear()
+            self._status_field.setStringValue_("Listening…")
             self._text_view.setString_("")
-            if self._llm_text_view:
-                self._llm_text_view.setString_("")
-            if self._llm_label:
-                self._llm_label.setHidden_(True)
-            if self._llm_scroll_view:
-                self._llm_scroll_view.setHidden_(True)
-            self._update_target_app()
-            # Reset to min size
-            frame = self._panel.frame()
-            self._panel.setFrame_display_(
-                AppKit.NSMakeRect(frame.origin.x, self._screen_y, _WIDTH, _MIN_HEIGHT), True
+            self._text_view.setTextColor_(
+                self._preview_color() if self._show_llm else self._final_color()
             )
+            self._update_target_app()
+            self._panel.setFrame_display_animate_(
+                self._frame_for_height(_MIN_HEIGHT), True, True
+            )
+            self._layout(_MIN_HEIGHT)
 
         AppHelper.callAfter(_reset)
 
     def update_text(self, text: str) -> None:
+        """Live raw transcription: shown as a dim preview until the first
+        cleaned version arrives (or as the only text when LLM is off)."""
+
         def _update():
+            if self._show_llm and self._has_cleaned:
+                return
             self._text_view.setString_(text)
             self._resize_panel()
-            end = len(self._text_view.string())
-            self._text_view.scrollRangeToVisible_(NSRange(end, 0))
+            self._text_view.scrollRangeToVisible_(NSRange(len(self._text_view.string()), 0))
 
         AppHelper.callAfter(_update)
 
     def update_llm_text(self, text: str) -> None:
         def _update():
-            if not self._show_llm or not self._llm_text_view:
+            if not self._show_llm:
                 return
-            self._llm_label.setHidden_(False)
-            self._llm_scroll_view.setHidden_(False)
-            self._llm_text_view.setString_(text)
+            self._has_cleaned = True
+            self._text_view.setTextColor_(self._final_color())
+            self._text_view.setString_(text)
             self._resize_panel()
-            end = len(self._llm_text_view.string())
-            self._llm_text_view.scrollRangeToVisible_(NSRange(end, 0))
+            self._text_view.scrollRangeToVisible_(NSRange(len(self._text_view.string()), 0))
 
         AppHelper.callAfter(_update)
 
     def update_status(self, status: str) -> None:
-        def _update():
-            self._status_field.setStringValue_(status)
-            if "listen" in status.lower():
-                self._status_field.setTextColor_(AppKit.NSColor.systemRedColor())
-            else:
-                self._status_field.setTextColor_(AppKit.NSColor.systemYellowColor())
-
-        AppHelper.callAfter(_update)
+        AppHelper.callAfter(self._status_field.setStringValue_, status)
 
     def run_event_loop(self) -> None:
         signal.signal(signal.SIGINT, signal.SIG_DFL)

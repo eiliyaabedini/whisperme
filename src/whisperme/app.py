@@ -7,9 +7,9 @@ import threading
 
 from PyObjCTools import AppHelper
 
-from whisperme import autofix, permissions
+from whisperme import autofix, permissions, voice_commands
 from whisperme.config import Config
-from whisperme.hotkey import HotkeyListener
+from whisperme.hotkey import KEY_PERIOD, KEY_R, KEY_SLASH, KEY_X, HotkeyListener
 from whisperme.overlay import Overlay
 from whisperme.paster import paste
 from whisperme.paths import app_bundle_path
@@ -36,8 +36,16 @@ class App:
         self._recorder = Recorder(
             config=config,
             on_realtime_update=self._on_realtime_text,
+            on_audio_level=self._on_audio_level,
         )
-        self._hotkey = HotkeyListener(on_toggle=self._toggle)
+        self._hotkey = HotkeyListener(
+            bindings={
+                KEY_SLASH: self._hotkey_toggle,
+                KEY_PERIOD: self._hotkey_close,  # next to /, easy reach
+                KEY_X: self._hotkey_close,
+                KEY_R: self._hotkey_reset,
+            }
+        )
         self._autofixer = autofix.AutoFixer()
         self._statusbar = StatusBar(
             on_quit=self.shutdown,
@@ -48,6 +56,11 @@ class App:
         self._llm_running = False
         self._llm_pending: str | None = None
         self._llm_last_input: str = ""
+
+        # A voice command only fires after being detected in two consecutive
+        # realtime updates — a command mid-sentence disappears from the tail
+        # on the next update, a real one (followed by silence) repeats.
+        self._voice_cmd_pending: str | None = None
 
     def run(self) -> None:
         # Start recorder worker thread (doesn't open mic until first activation)
@@ -64,7 +77,7 @@ class App:
             hotkey_ok = permissions.hotkey_failure_flow(self._hotkey.start)
         self._statusbar.set_permissions_ok(report.all_granted and hotkey_ok)
 
-        print("[whisperme] Ready! Press Option+/ to start/stop dictation.")
+        print("[whisperme] Ready! Option+/ start/stop · Option+. or Option+X cancel · Option+R reset")
         print("[whisperme] First activation will load models (may take a few seconds).")
         if not self._config.no_llm:
             print("[whisperme] LLM post-processing enabled (Apple Foundation Model)")
@@ -87,6 +100,25 @@ class App:
                 self._stop_recording()
             else:
                 self._start_recording()
+
+    def _hotkey_toggle(self) -> bool:
+        self._toggle()
+        return True
+
+    def _hotkey_close(self) -> bool:
+        """Option+X: cancel — only consumed while recording, so the key still
+        types its normal character otherwise."""
+        if not self._recording:
+            return False
+        self._close_without_paste()
+        return True
+
+    def _hotkey_reset(self) -> bool:
+        """Option+R: reset — only consumed while recording."""
+        if not self._recording:
+            return False
+        self._reset_recording()
+        return True
 
     def _run_permission_setup(self) -> None:
         """Menu action: re-run the interactive permission wizard."""
@@ -154,14 +186,17 @@ class App:
     def _start_recording(self) -> None:
         logger.info("Recording start requested")
         self._recording = True
+        self._voice_cmd_pending = None
         self._llm_last_input = ""
         self._overlay.show()
         self._statusbar.set_state("recording")
         threading.Thread(target=self._recorder.start, daemon=True).start()
 
-    def _stop_recording(self) -> None:
+    def _stop_recording(self, text_transform=None) -> None:
         self._recording = False
         text = self._recorder.stop()
+        if text_transform is not None:
+            text = text_transform(text)
         logger.info("Recording stopped: final_text_len=%d", len(text))
         self._overlay.hide()
 
@@ -189,6 +224,7 @@ class App:
         logger.info("Reset requested")
         with self._lock:
             self._recording = False
+            self._voice_cmd_pending = None
             self._llm_pending = None
             self._recorder.stop()
             self._overlay.reset()
@@ -248,10 +284,34 @@ class App:
                     self._llm_running = False
                     return
 
+    def _on_audio_level(self, level: float) -> None:
+        if self._recording:
+            self._overlay.push_level(level)
+
+    def _handle_voice_command(self, command: str) -> None:
+        logger.info("Voice command detected: %s", command)
+        if command == "cancel":
+            self._close_without_paste()
+        elif command == "reset":
+            self._reset_recording()
+        elif command == "paste":
+            with self._lock:
+                if self._recording:
+                    self._stop_recording(text_transform=voice_commands.strip_tail)
+
     def _on_realtime_text(self, text: str) -> None:
         with self._lock:
             if not self._recording:
                 return
+        command = voice_commands.match(text)
+        if command is not None:
+            if command == self._voice_cmd_pending:
+                self._voice_cmd_pending = None
+                self._handle_voice_command(command)
+            else:
+                self._voice_cmd_pending = command
+            return
+        self._voice_cmd_pending = None
         self._overlay.update_text(text)
         if not self._config.no_llm:
             self._schedule_llm_cleanup(text)
