@@ -19,9 +19,11 @@ class Recorder:
         self,
         config: Config,
         on_realtime_update: Callable[[str], None] | None = None,
+        on_audio_level: Callable[[float], None] | None = None,
     ) -> None:
         self._config = config
         self._on_realtime_update = on_realtime_update
+        self._on_audio_level = on_audio_level
         self._latest_text: str = ""
         self._lock = threading.Lock()
         self._commands: queue.Queue[str] = queue.Queue()
@@ -263,6 +265,18 @@ class Recorder:
                     logger.exception("ERROR feeding audio")
                     print(f"[recorder] ERROR feeding audio: {e}", flush=True)
                 break
+
+            if self._on_audio_level is not None:
+                try:
+                    import numpy as np
+
+                    samples = np.frombuffer(chunk, dtype=np.int16)
+                    if samples.size:
+                        rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
+                        # ~4000 RMS is loud speech on a typical laptop mic
+                        self._on_audio_level(min(1.0, rms / 4000.0))
+                except Exception:
+                    pass
 
     def _handle_realtime(self, text: str) -> None:
         stripped = text.strip()
