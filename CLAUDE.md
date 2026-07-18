@@ -7,13 +7,14 @@ Local push-to-talk voice dictation for macOS. Press Option+/ to record, release 
 - `src/whisperme/app.py` — Orchestrator: hotkey -> recorder -> overlay -> paster
 - `src/whisperme/recorder.py` — Wraps RealtimeSTT with manual mic feeding (`use_microphone=False`)
 - `src/whisperme/overlay.py` — Floating NSPanel (AppKit) showing live transcription
-- `src/whisperme/hotkey.py` — Quartz CGEventTap for global Option+/ hotkey
+- `src/whisperme/hotkey.py` — Quartz CGEventTap for global hotkeys: ⌥/ toggle; ⌥X cancel and ⌥R reset consume the key only while recording (pass through otherwise)
 - `src/whisperme/paster.py` — pbcopy + simulated Cmd+V via pynput
 - `src/whisperme/postprocess.py` — Optional Apple Foundation Model cleanup
 - `src/whisperme/statusbar.py` — NSStatusItem menu bar icon (idle/recording/processing states, quit, start-at-login)
 - `src/whisperme/permissions.py` — Interactive Microphone + Accessibility setup wizard (NSAlert flow)
 - `src/whisperme/autofix.py` — "Auto-Fix Recent Issues" menu action: runs `claude -p` headlessly (scoped --allowedTools) to diagnose recent crashes from logs/, fix src/, commit + push; report saved to logs/autofix/
 - `src/whisperme/autostart.py` — Start-at-login LaunchAgent (~/Library/LaunchAgents/com.eiliya.whisperme.plist)
+- `src/whisperme/voice_commands.py` — Spoken commands in the live transcription: "whisperme cancel/reset/done" (wake word + adjacent verb) or a doubled verb like "cancel cancel"; end-anchored, and app.py requires the match in two consecutive realtime updates before firing
 - `src/whisperme/paths.py` — Shared REPO_DIR/LOG_DIR + app bundle discovery
 - `src/whisperme/config.py` — CLI args (--model, --realtime-model, --language, --no-llm, --no-setup)
 

@@ -8,8 +8,10 @@ import Quartz
 logger = logging.getLogger(__name__)
 
 
-# Key code for "/" on US keyboard
-_SLASH_KEYCODE = 44
+# US-layout virtual keycodes
+KEY_SLASH = 44
+KEY_X = 7
+KEY_R = 15
 
 # The OS delivers these event types when it disables a tap. They are sent
 # regardless of the event mask, so the callback must handle them explicitly.
@@ -18,15 +20,21 @@ _TAP_DISABLED_USER_INPUT = getattr(Quartz, "kCGEventTapDisabledByUserInput", 0xF
 
 
 class HotkeyListener:
-    """Detects Option+/ toggle using Quartz CGEventTap (suppresses the keystroke)."""
+    """Global Option+<key> hotkeys via a Quartz CGEventTap.
 
-    def __init__(self, on_toggle: Callable[[], None]) -> None:
-        self._on_toggle = on_toggle
+    ``bindings`` maps a keycode to a handler that returns True when it
+    consumed the event — the keystroke is then suppressed system-wide.
+    Returning False lets the event pass through unchanged, so e.g. Option+X
+    still types "≈" whenever WhisperMe isn't recording.
+    """
+
+    def __init__(self, bindings: dict[int, Callable[[], bool]]) -> None:
+        self._bindings = bindings
         self._tap = None
         self._loop_source = None
 
     def start(self) -> bool:
-        """Register the global event tap. Returns True if the hotkey is active."""
+        """Register the global event tap. Returns True if the hotkeys are active."""
         if self._tap is not None:
             return True
 
@@ -49,15 +57,17 @@ class HotkeyListener:
                 flags = Quartz.CGEventGetFlags(event)
                 option = bool(flags & Quartz.kCGEventFlagMaskAlternate)
 
-                if option and keycode == _SLASH_KEYCODE:
-                    print("[hotkey] Option+/ detected!", flush=True)
-                    logger.info("Option+/ detected")
-                    try:
-                        self._on_toggle()
-                    except Exception:
-                        logger.exception("on_toggle callback crashed")
-                    # Suppress the keystroke so '÷' isn't typed
-                    return None
+                if option:
+                    handler = self._bindings.get(keycode)
+                    if handler is not None:
+                        logger.info("Hotkey Option+keycode=%d detected", keycode)
+                        try:
+                            consumed = handler()
+                        except Exception:
+                            logger.exception("Hotkey handler crashed")
+                            consumed = True  # it was our combo; don't leak the keystroke
+                        if consumed:
+                            return None
             except Exception:
                 logger.exception("Hotkey callback crashed")
             return event
