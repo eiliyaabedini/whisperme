@@ -9,7 +9,7 @@ from PyObjCTools import AppHelper
 
 from whisperme import autofix, permissions, voice_commands
 from whisperme.config import Config
-from whisperme.hotkey import KEY_R, KEY_SLASH, KEY_X, HotkeyListener
+from whisperme.hotkey import KEY_PERIOD, KEY_R, KEY_SLASH, KEY_X, HotkeyListener
 from whisperme.overlay import Overlay
 from whisperme.paster import paste
 from whisperme.paths import app_bundle_path
@@ -41,6 +41,7 @@ class App:
         self._hotkey = HotkeyListener(
             bindings={
                 KEY_SLASH: self._hotkey_toggle,
+                KEY_PERIOD: self._hotkey_close,  # next to /, easy reach
                 KEY_X: self._hotkey_close,
                 KEY_R: self._hotkey_reset,
             }
@@ -76,7 +77,7 @@ class App:
             hotkey_ok = permissions.hotkey_failure_flow(self._hotkey.start)
         self._statusbar.set_permissions_ok(report.all_granted and hotkey_ok)
 
-        print("[whisperme] Ready! Option+/ start/stop · Option+X cancel · Option+R reset")
+        print("[whisperme] Ready! Option+/ start/stop · Option+. or Option+X cancel · Option+R reset")
         print("[whisperme] First activation will load models (may take a few seconds).")
         if not self._config.no_llm:
             print("[whisperme] LLM post-processing enabled (Apple Foundation Model)")

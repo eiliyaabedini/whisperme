@@ -196,7 +196,7 @@ class Overlay:
         self._close_btn = self._make_icon_button(
             "xmark.circle.fill",
             "X",
-            "Close without pasting (⌥X)",
+            "Close without pasting (⌥. or ⌥X)",
             objc.selector(self._button_target.onClose_, signature=b"v@:@"),
         )
         content.addSubview_(self._close_btn)

@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 
 # US-layout virtual keycodes
 KEY_SLASH = 44
+KEY_PERIOD = 47
 KEY_X = 7
 KEY_R = 15
 

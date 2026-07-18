@@ -7,7 +7,7 @@ Local push-to-talk voice dictation for macOS. Press Option+/ to record, release 
 - `src/whisperme/app.py` — Orchestrator: hotkey -> recorder -> overlay -> paster
 - `src/whisperme/recorder.py` — Wraps RealtimeSTT with manual mic feeding (`use_microphone=False`)
 - `src/whisperme/overlay.py` — Floating NSPanel (AppKit) showing live transcription
-- `src/whisperme/hotkey.py` — Quartz CGEventTap for global hotkeys: ⌥/ toggle; ⌥X cancel and ⌥R reset consume the key only while recording (pass through otherwise)
+- `src/whisperme/hotkey.py` — Quartz CGEventTap for global hotkeys: ⌥/ toggle; ⌥. or ⌥X cancel and ⌥R reset consume the key only while recording (pass through otherwise)
 - `src/whisperme/paster.py` — pbcopy + simulated Cmd+V via pynput
 - `src/whisperme/postprocess.py` — Optional Apple Foundation Model cleanup
 - `src/whisperme/statusbar.py` — NSStatusItem menu bar icon (idle/recording/processing states, quit, start-at-login)
