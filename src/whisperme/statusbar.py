@@ -9,7 +9,7 @@ import objc
 from Foundation import NSObject
 from PyObjCTools import AppHelper
 
-from whisperme import autostart
+from whisperme import autofix, autostart
 from whisperme.paths import LOG_DIR
 
 logger = logging.getLogger(__name__)
@@ -111,16 +111,21 @@ class StatusBar:
 
         menu.addItem_(AppKit.NSMenuItem.separatorItem())
 
-        self._autofix_menu_item = menu.addItemWithTitle_action_keyEquivalent_(
-            "Auto-Fix Recent Issues",
-            objc.selector(self._target.onAutoFix_, signature=b"v@:@"),
-            "",
-        )
-        self._autofix_menu_item.setTarget_(self._target)
-        self._autofix_menu_item.setToolTip_(
-            "Run Claude Code headlessly to diagnose recent crashes from the "
-            "logs, fix the code, and push the fix"
-        )
+        # Developer-only: Auto-Fix edits the source checkout and pushes. There is
+        # no checkout behind a downloaded .app, so the item is omitted entirely
+        # rather than shown disabled.
+        self._autofix_menu_item = None
+        if autofix.is_available():
+            self._autofix_menu_item = menu.addItemWithTitle_action_keyEquivalent_(
+                "Auto-Fix Recent Issues",
+                objc.selector(self._target.onAutoFix_, signature=b"v@:@"),
+                "",
+            )
+            self._autofix_menu_item.setTarget_(self._target)
+            self._autofix_menu_item.setToolTip_(
+                "Run Claude Code headlessly to diagnose recent crashes from the "
+                "logs, fix the code, and push the fix"
+            )
 
         self._permissions_menu_item = menu.addItemWithTitle_action_keyEquivalent_(
             "Permission Setup…",
@@ -163,6 +168,9 @@ class StatusBar:
         AppHelper.callAfter(self._apply_state, state)
 
     def set_autofix_running(self, running: bool) -> None:
+        if self._autofix_menu_item is None:
+            return
+
         def _apply() -> None:
             self._autofix_menu_item.setEnabled_(not running)
             self._autofix_menu_item.setTitle_(

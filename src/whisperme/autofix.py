@@ -100,6 +100,15 @@ def find_claude() -> str | None:
     return shutil.which("claude")
 
 
+def is_available() -> bool:
+    """Auto-Fix only makes sense when running from a source checkout.
+
+    It edits src/ and pushes to the whisperme remote, so a downloaded .app has
+    nothing to repair — REPO_DIR is None there and the menu item stays hidden.
+    """
+    return REPO_DIR is not None and find_claude() is not None
+
+
 def _git_head() -> str:
     try:
         return subprocess.run(
