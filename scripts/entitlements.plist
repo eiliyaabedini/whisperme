@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Dictation records from the mic while Option+/ is held. -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+
+    <!-- The bundled CPython dlopen()s hundreds of .so files from site-packages
+         (torch, ctranslate2, onnxruntime, pyobjc). Under the hardened runtime
+         library validation would reject every one of them, since they are not
+         signed by our team ID. -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+
+    <!-- torch and onnxruntime generate code at runtime. -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+
+    <!-- Pasting the transcript simulates Cmd+V through Apple events. -->
+    <key>com.apple.security.automation.apple-events</key>
+    <true/>
+</dict>
+</plist>

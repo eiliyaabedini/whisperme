@@ -9,6 +9,7 @@ from PyObjCTools import AppHelper
 
 from whisperme import autofix, permissions, voice_commands
 from whisperme.config import Config
+from whisperme.download_window import ensure_models_downloaded
 from whisperme.hotkey import KEY_PERIOD, KEY_R, KEY_SLASH, KEY_X, HotkeyListener
 from whisperme.overlay import Overlay
 from whisperme.paster import paste
@@ -63,6 +64,12 @@ class App:
         self._voice_cmd_pending: str | None = None
 
     def run(self) -> None:
+        # Models are not shipped in the DMG. Fetch any that are missing before
+        # the recorder starts: RealtimeSTT would otherwise download them inside
+        # its subprocess with no UI, looking like a multi-minute hang.
+        if not self._download_models():
+            return
+
         # Start recorder worker thread (doesn't open mic until first activation)
         threading.Thread(target=self._recorder.run_worker, daemon=True).start()
 
@@ -87,6 +94,25 @@ class App:
             self._overlay.run_event_loop()
         except KeyboardInterrupt:
             self.shutdown()
+
+    def _download_models(self) -> bool:
+        """Fetch missing Whisper models. False means the user should not continue."""
+        error = ensure_models_downloaded([self._config.model, self._config.realtime_model])
+        if error is None:
+            return True
+
+        logger.error("Model download failed: %s", error)
+        choice = permissions.alert(
+            "Could Not Download Speech Models",
+            "WhisperMe needs to download its speech models the first time it runs, "
+            "and that download failed.\n\n"
+            f"{error}\n\n"
+            "Check your internet connection and open WhisperMe again.",
+            ["Quit", "Try Again"],
+        )
+        if choice == 1:
+            return self._download_models()
+        return False
 
     def shutdown(self) -> None:
         print("\n[whisperme] Shutting down...")
@@ -130,7 +156,7 @@ class App:
 
     def _start_autofix(self) -> None:
         """Menu action: headless Claude Code session to diagnose + fix + push."""
-        if autofix.find_claude() is None:
+        if not autofix.is_available():
             permissions.alert(
                 "Claude Code Not Found",
                 "Auto-Fix runs the claude CLI, which wasn't found on this Mac.\n\n"

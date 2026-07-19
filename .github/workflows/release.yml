@@ -1,0 +1,129 @@
+name: Release
+
+# Push a tag to publish a DMG:  git tag v0.2.0 && git push origin v0.2.0
+# Also runnable from the Actions tab for a test build (no release published).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # macOS 14+ runners are Apple Silicon, which is what the bundle targets.
+    runs-on: macos-14
+
+    # Declared at job level so the `if:` on each step can see them — a step's
+    # own `env:` block is not in scope for its own condition.
+    env:
+      MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # Signing is optional: without the secrets the build still succeeds and
+      # produces an ad-hoc signed DMG, which macOS will quarantine on download.
+      - name: Set up signing certificate
+        id: signing
+        if: env.MACOS_CERTIFICATE_P12 != ''
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          echo "$MACOS_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | grep "Developer ID Application" | head -1 \
+            | sed -E 's/.*"(.*)"/\1/')"
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::No Developer ID Application identity in the imported certificate"
+            exit 1
+          fi
+          echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
+          echo "Using identity: $IDENTITY"
+
+      - name: Store notarization credentials
+        id: notary
+        if: steps.signing.outcome == 'success' && env.APPLE_ID != ''
+        run: |
+          set -euo pipefail
+          xcrun notarytool store-credentials whisperme-notary \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --keychain "$RUNNER_TEMP/build.keychain"
+          echo "profile=whisperme-notary" >> "$GITHUB_OUTPUT"
+
+      - name: Build app
+        env:
+          WHISPERME_SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
+        run: ./scripts/build-app.sh
+
+      - name: Build DMG
+        env:
+          WHISPERME_SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
+          WHISPERME_NOTARY_PROFILE: ${{ steps.notary.outputs.profile }}
+        run: ./scripts/make-dmg.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WhisperMe-dmg
+          path: dist/*.dmg
+          retention-days: 14
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          DMG="dist/WhisperMe-$VERSION.dmg"
+          SHA="$(shasum -a 256 "$DMG" | cut -d' ' -f1)"
+
+          {
+            echo "## Install"
+            echo
+            echo "1. Download \`WhisperMe-$VERSION.dmg\` below."
+            echo "2. Open it and drag **WhisperMe** into **Applications**."
+            echo "3. Launch WhisperMe and follow the permission setup."
+            echo
+            if [ -z "${{ steps.notary.outputs.profile }}" ]; then
+              echo "> **Note** — this build is not notarized, so macOS will claim"
+              echo "> WhisperMe \"is damaged\". It isn't. To open it anyway:"
+              echo "> \`xattr -dr com.apple.quarantine /Applications/WhisperMe.app\`"
+              echo
+            fi
+            echo "First launch downloads the speech models (~1.6 GB); after that"
+            echo "everything runs offline on your Mac."
+            echo
+            echo "**Requires** an Apple Silicon Mac on macOS 12 or later."
+            echo
+            echo "\`sha256: $SHA\`"
+          } > notes.md
+
+          gh release create "$GITHUB_REF_NAME" "$DMG" \
+            --title "WhisperMe $VERSION" --notes-file notes.md
