@@ -194,6 +194,11 @@ def _show_already_running_alert() -> None:
 
 def main() -> None:
     _setup_logging()
+    # RealtimeSTT creates ``realtimesst.log`` using a relative path. Apps
+    # launched by Finder can inherit ``/`` as their working directory, which
+    # is read-only and prevents the recorder from initializing. Keep relative
+    # third-party files alongside WhisperMe's other writable logs.
+    os.chdir(LOG_DIR)
     _install_excepthooks()
     config = Config.from_args()
     if not _acquire_single_instance_lock():
